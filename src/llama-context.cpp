@@ -9,6 +9,8 @@
 #include "llama-model.h"
 #include "llama-ext.h"
 
+#include "llama-kairox.h"
+
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -2154,6 +2156,7 @@ llm_graph_params llama_context::graph_params(
         /*.gtype       =*/ gtype,
         /*.sched       =*/ sched.get(),
         /*.backend_cpu =*/ backend_cpu,
+        /*.backend_gpu =*/ backends[0].get(),
         /*.cvec        =*/ cvec.get(),
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
@@ -2162,6 +2165,7 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.kairox_cm   =*/ kairox_cm.get(),
     };
 }
 

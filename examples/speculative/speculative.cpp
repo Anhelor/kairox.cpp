@@ -8,6 +8,8 @@
 #include <clocale>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <numeric>
 #include <random>
 #include <set>
 #include <string>
@@ -29,6 +31,455 @@ struct seq_draft {
 
     struct common_sampler * smpl = nullptr;
 };
+
+struct speculative_bench_run_data {
+    int32_t n_prompt = 0;
+    int32_t n_decode = 0;
+    int64_t t_prompt_us = 0;
+    int64_t t_decode_us = 0;
+};
+
+static std::vector<std::string> load_bench_prompts_from_file(const std::string & path) {
+    std::vector<std::string> prompts;
+    std::ifstream file(path);
+    if (!file) {
+        LOG_ERR("failed to open benchmark prompt file: '%s'\n", path.c_str());
+        return prompts;
+    }
+
+    std::string line;
+    while (std::getline(file, line)) {
+        if (!line.empty()) {
+            prompts.push_back(std::move(line));
+        }
+    }
+
+    return prompts;
+}
+
+static bool decode_or_log(llama_context * ctx, llama_batch batch, const char * where) {
+    const int ret = llama_decode(ctx, batch);
+    if (ret != 0) {
+        LOG_ERR("%s: llama_decode failed, ret = %d\n", where, ret);
+        return false;
+    }
+
+    return true;
+}
+
+static bool speculative_bench_run_one(
+               llama_model *                   model_tgt,
+               llama_model *                   model_dft,
+             llama_context *                 ctx_tgt,
+             llama_context *                 ctx_dft,
+             llama_memory_t                  mem_tgt,
+             llama_memory_t                  mem_dft,
+       const llama_vocab *                   vocab_tgt,
+             common_params &                 params,
+                      int                    n_seq_dft,
+                    float                    p_draft_split,
+    std::default_random_engine &             rng,
+    std::uniform_real_distribution<> &       u_dist,
+      const std::string &                    prompt,
+    speculative_bench_run_data &             out) {
+    llama_memory_clear(mem_tgt, true);
+    llama_memory_clear(mem_dft, true);
+    llama_perf_context_reset(ctx_tgt);
+    llama_perf_context_reset(ctx_dft);
+
+    std::vector<llama_token> inp = common_tokenize(ctx_tgt, prompt, true, true);
+
+    const int max_context_size     = llama_n_ctx(ctx_tgt);
+    const int max_tokens_list_size = max_context_size - 4;
+
+    if ((int) inp.size() > max_tokens_list_size) {
+        LOG_ERR("%s: prompt too long (%d tokens, max %d)\n", __func__, (int) inp.size(), max_tokens_list_size);
+        return false;
+    }
+
+    const int n_input = inp.size();
+
+    const auto t_enc_start = ggml_time_us();
+
+    if (!decode_or_log(ctx_tgt, llama_batch_get_one( inp.data(), n_input - 1), __func__)) {
+        return false;
+    }
+    if (!decode_or_log(ctx_tgt, llama_batch_get_one(&inp.back(),           1), __func__)) {
+        return false;
+    }
+    if (!decode_or_log(ctx_dft, llama_batch_get_one( inp.data(), n_input), __func__)) {
+        return false;
+    }
+
+    const auto t_enc_end = ggml_time_us();
+
+    int n_predict = 0;
+    int n_past_tgt = inp.size();
+    int n_past_dft = inp.size();
+    const int n_ctx_tgt = llama_n_ctx(ctx_tgt);
+    const int n_ctx_dft = llama_n_ctx(ctx_dft);
+
+    bool has_eos = false;
+
+    struct common_sampler * smpl = common_sampler_init(model_tgt, params.sampling);
+    std::vector<seq_draft> drafts(n_seq_dft);
+
+    for (int s = 0; s < n_seq_dft; ++s) {
+        drafts[s].smpl = common_sampler_init(model_dft, params.sampling);
+    }
+
+    llama_batch batch_dft = llama_batch_init(llama_n_batch(ctx_dft), 0, 1);
+    llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx_tgt), 0, n_seq_dft);
+
+    const auto t_dec_start = ggml_time_us();
+
+    drafts[0].i_batch_tgt.resize(1);
+    drafts[0].i_batch_tgt[0] = 0;
+
+    while (true) {
+        std::set<int> active_seqs = {};
+
+        for (int s = 0; s < n_seq_dft; ++s) {
+            if (!drafts[s].active) {
+                continue;
+            }
+            active_seqs.insert(s);
+        }
+
+        int i_dft  = 0;
+        int s_keep = 0;
+
+        llama_token token_id;
+        while (true) {
+            {
+                bool accept = false;
+                if (params.sampling.temp > 0) {
+                    common_sampler_sample(smpl, ctx_tgt, drafts[s_keep].i_batch_tgt[i_dft], true);
+
+                    auto & dist_tgt = *common_sampler_get_candidates(smpl, true);
+
+                    float p_tgt = 0.0f;
+                    float p_dft = 0.0f;
+
+                    while (active_seqs.size() > 0) {
+                        std::uniform_int_distribution<unsigned int> u_int_dist(0, active_seqs.size() - 1);
+                        int s = *std::next(active_seqs.begin(), u_int_dist(rng));
+                        if (i_dft >= (int) drafts[s].tokens.size()) {
+                            drafts[s].active = false;
+                            active_seqs.erase(s);
+                            continue;
+                        }
+                        if (accept) {
+                            if (drafts[s].tokens[i_dft] != drafts[s_keep].tokens[i_dft]) {
+                                drafts[s].active = false;
+                                active_seqs.erase(s);
+                            }
+                            continue;
+                        }
+
+                        float r = u_dist(rng);
+                        llama_token_data_array dist_dft = { drafts[s].dists[i_dft].data() , drafts[s].dists[i_dft].size(), LLAMA_TOKEN_NULL, true };
+
+                        for (size_t i = 0; i < dist_tgt.size; i++) {
+                            if (dist_tgt.data[i].id == drafts[s].tokens[i_dft]) {
+                                p_tgt = dist_tgt.data[i].p;
+                                break;
+                            }
+                        }
+                        for (size_t i = 0; i < dist_dft.size; i++) {
+                            if (dist_dft.data[i].id == drafts[s].tokens[i_dft]) {
+                                p_dft = dist_dft.data[i].p;
+                                break;
+                            }
+                        }
+                        if (r <= p_tgt / p_dft) {
+                            s_keep = s;
+                            accept = true;
+                            token_id = drafts[s].tokens[i_dft];
+                            common_sampler_accept(smpl, token_id, true);
+                            break;
+                        } else {
+                            drafts[s].active = false;
+
+                            GGML_ASSERT(dist_tgt.sorted);
+                            GGML_ASSERT(dist_dft.sorted);
+
+                            std::sort(dist_tgt.data, dist_tgt.data + dist_tgt.size, [](const llama_token_data &a, const llama_token_data &b) {
+                                return a.id < b.id;
+                            });
+                            std::sort(dist_dft.data, dist_dft.data + dist_dft.size, [](const llama_token_data &a, const llama_token_data &b) {
+                                return a.id < b.id;
+                            });
+
+                            float sum_probs = 0.0f;
+
+                            for (size_t i = 0; i < dist_tgt.size; i++) {
+                                if (i < dist_dft.size) {
+                                    dist_tgt.data[i].p = std::max(0.0f, dist_tgt.data[i].p - dist_dft.data[i].p);
+                                } else {
+                                    dist_tgt.data[i].p = std::max(0.0f, dist_tgt.data[i].p);
+                                }
+                                sum_probs += dist_tgt.data[i].p;
+                            }
+
+                            for (size_t i = 0; i < dist_tgt.size; i++) {
+                                dist_tgt.data[i].p /= sum_probs;
+                            }
+
+                            std::sort(dist_tgt.data, dist_tgt.data + dist_tgt.size, [](const llama_token_data &a, const llama_token_data &b) {
+                                return a.p > b.p;
+                            });
+                        }
+
+                        active_seqs.erase(s);
+                        for (int i = 0; i < n_seq_dft; i++) {
+                            if (i == s) {
+                                continue;
+                            }
+                            if (drafts[i].active && drafts[i].tokens[i_dft] == drafts[s].tokens[i_dft]) {
+                                drafts[i].active = drafts[i].active && accept;
+                                if (!drafts[i].active) {
+                                    active_seqs.erase(s);
+                                }
+                            }
+                        }
+                    }
+
+                    if (!accept) {
+                        std::vector<float> probs(dist_tgt.size);
+                        for (size_t i = 0; i < dist_tgt.size; ++i) {
+                            probs[i] = dist_tgt.data[i].p;
+                        }
+
+                        std::discrete_distribution<> dist(probs.begin(), probs.end());
+                        const int idx = dist(rng);
+                        token_id = dist_tgt.data[idx].id;
+                        common_sampler_accept(smpl, token_id, true);
+                    }
+                } else {
+                    token_id = common_sampler_sample(smpl, ctx_tgt, drafts[s_keep].i_batch_tgt[i_dft]);
+                    common_sampler_accept(smpl, token_id, true);
+
+                    for (int s = 0; s < n_seq_dft; ++s) {
+                        if (!drafts[s].active) {
+                            continue;
+                        }
+
+                        if (i_dft < (int) drafts[s].tokens.size() && token_id == drafts[s].tokens[i_dft]) {
+                            s_keep = s;
+                            accept = true;
+                        } else {
+                            drafts[s].active = false;
+                        }
+                    }
+                }
+
+                if (llama_vocab_is_eog(vocab_tgt, token_id)) {
+                    has_eos = true;
+                }
+                ++n_predict;
+
+                if (accept) {
+                    ++n_past_tgt;
+                    ++n_past_dft;
+                    ++i_dft;
+                    continue;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        {
+            {
+                llama_memory_seq_keep(mem_dft, s_keep);
+                llama_memory_seq_cp  (mem_dft, s_keep, 0, -1, -1);
+                llama_memory_seq_keep(mem_dft, 0);
+
+                llama_memory_seq_rm  (mem_tgt, s_keep, n_past_tgt, -1);
+                llama_memory_seq_keep(mem_tgt, s_keep);
+                llama_memory_seq_cp  (mem_tgt, s_keep, 0, -1, -1);
+                llama_memory_seq_keep(mem_tgt, 0);
+            }
+
+            for (int s = 0; s < n_seq_dft; ++s) {
+                drafts[s].active = false;
+                drafts[s].tokens.clear();
+                drafts[s].i_batch_tgt.clear();
+                drafts[s].dists.clear();
+            }
+            drafts[0].tokens.push_back(token_id);
+            drafts[0].dists.push_back(std::vector<llama_token_data>());
+            drafts[0].i_batch_tgt.push_back(0);
+
+            if (n_past_dft >= n_ctx_dft) {
+                LOG_WRN("%s: benchmark draft context full => stopping run\n", __func__);
+                break;
+            }
+
+            common_batch_clear(batch_dft);
+            common_batch_add  (batch_dft, token_id, n_past_dft, { 0 }, true);
+
+            llama_memory_seq_rm(mem_dft, 0, n_past_dft, -1);
+            if (!decode_or_log(ctx_dft, batch_dft, __func__)) {
+                return false;
+            }
+
+            ++n_past_dft;
+        }
+
+        if ((params.n_predict >= 0 && n_predict > params.n_predict) || has_eos) {
+            break;
+        }
+
+        if (drafts[0].smpl) {
+            common_sampler_free(drafts[0].smpl);
+        }
+        drafts[0].smpl = common_sampler_clone(smpl);
+
+        int n_seq_cur  = 1;
+        int n_past_cur = n_past_dft;
+
+        for (int s = 0; s < n_seq_dft; ++s) {
+            drafts[s].active   = false;
+            drafts[s].drafting = false;
+        }
+        drafts[0].active      = true;
+        drafts[0].drafting    = true;
+        drafts[0].i_batch_dft = 0;
+
+        if (n_past_tgt >= n_ctx_tgt) {
+            LOG_WRN("%s: benchmark context full => stopping run\n", __func__);
+            break;
+        }
+
+        common_batch_clear(batch_tgt);
+        common_batch_add  (batch_tgt, drafts[0].tokens[0], n_past_tgt, { 0 }, true);
+
+        for (int i = 0; i < params.speculative.n_max; ++i) {
+            if (n_past_tgt + i + 1 >= n_ctx_tgt || n_past_cur >= n_ctx_dft) {
+                break;
+            }
+
+            batch_dft.n_tokens = 0;
+
+            for (int s = 0; s < n_seq_dft; ++s) {
+                drafts[s].skip = false;
+            }
+
+            for (int s = 0; s < n_seq_dft; ++s) {
+                if (!drafts[s].drafting || drafts[s].skip) {
+                    continue;
+                }
+
+                common_sampler_sample(drafts[s].smpl, ctx_dft, drafts[s].i_batch_dft, true);
+                const auto * cur_p = common_sampler_get_candidates(drafts[s].smpl, true);
+                std::vector<int> sa(1, s);
+
+                for (int f = 1; f < 8; ++f) {
+                    if (n_seq_cur < n_seq_dft && cur_p->data[f].p > p_draft_split) {
+                        llama_memory_seq_rm(mem_dft,    n_seq_cur, -1, -1);
+                        llama_memory_seq_cp(mem_dft, s, n_seq_cur, -1, -1);
+
+                        for (int t = 0; t < batch_tgt.n_tokens; ++t) {
+                            for (int p = 0; p < batch_tgt.n_seq_id[t]; ++p) {
+                                if (batch_tgt.seq_id[t][p] == s) {
+                                    batch_tgt.seq_id[t][batch_tgt.n_seq_id[t]] = n_seq_cur;
+                                    batch_tgt.n_seq_id[t]++;
+                                    break;
+                                }
+                            }
+                        }
+
+                        drafts[n_seq_cur].active   = true;
+                        drafts[n_seq_cur].drafting = true;
+                        drafts[n_seq_cur].skip     = true;
+                        drafts[n_seq_cur].tokens      = drafts[s].tokens;
+                        drafts[n_seq_cur].dists       = drafts[s].dists;
+                        drafts[n_seq_cur].i_batch_dft = drafts[s].i_batch_dft;
+                        drafts[n_seq_cur].i_batch_tgt = drafts[s].i_batch_tgt;
+                        if (drafts[n_seq_cur].smpl) {
+                            common_sampler_free(drafts[n_seq_cur].smpl);
+                        }
+                        drafts[n_seq_cur].smpl = common_sampler_clone(drafts[s].smpl);
+                        sa.push_back(n_seq_cur);
+                        n_seq_cur++;
+                    } else {
+                        break;
+                    }
+                }
+
+                for (int is = 0; is < (int) sa.size(); ++is) {
+                    const llama_token id = cur_p->data[is].id;
+                    const int s = sa[is];
+                    common_sampler_accept(drafts[s].smpl, id, true);
+                    drafts[s].tokens.push_back(id);
+                    drafts[s].dists.push_back({cur_p->data, cur_p->data + cur_p->size});
+                    drafts[s].i_batch_tgt.push_back(batch_tgt.n_tokens);
+                    common_batch_add(batch_tgt, id, n_past_tgt + i + 1, { s }, true);
+                    drafts[s].i_batch_dft = batch_dft.n_tokens;
+                    common_batch_add(batch_dft, id, n_past_cur, { s }, true);
+                    if (batch_tgt.n_tokens > params.speculative.n_max) {
+                        drafts[s].drafting = false;
+                    }
+                }
+            }
+
+            if (batch_dft.n_tokens == 0) {
+                break;
+            }
+
+            if (!decode_or_log(ctx_dft, batch_dft, __func__)) {
+                return false;
+            }
+            ++n_past_cur;
+
+            if (batch_tgt.n_tokens > params.speculative.n_max) {
+                break;
+            }
+        }
+
+        {
+            if (batch_tgt.n_tokens == 0) {
+                LOG_WRN("%s: benchmark context full => stopping run\n", __func__);
+                break;
+            }
+
+            llama_memory_seq_keep(mem_tgt, 0);
+            for (int s = 1; s < n_seq_dft; ++s) {
+                llama_memory_seq_cp(mem_tgt, 0, s, -1, -1);
+            }
+            if (!decode_or_log(ctx_tgt, batch_tgt, __func__)) {
+                return false;
+            }
+            ++n_past_tgt;
+        }
+
+        for (int s = 0; s < n_seq_dft; ++s) {
+            if (!drafts[s].active) {
+                continue;
+            }
+            drafts[s].tokens.erase(drafts[s].tokens.begin());
+            drafts[s].dists.erase(drafts[s].dists.begin());
+        }
+    }
+
+    const auto t_dec_end = ggml_time_us();
+
+    common_sampler_free(smpl);
+    for (int s = 0; s < n_seq_dft; ++s) {
+        common_sampler_free(drafts[s].smpl);
+    }
+
+    llama_batch_free(batch_dft);
+    llama_batch_free(batch_tgt);
+
+    out.n_prompt    = n_input;
+    out.n_decode    = n_predict;
+    out.t_prompt_us = t_enc_end - t_enc_start;
+    out.t_decode_us = t_dec_end - t_dec_start;
+    return true;
+}
 
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
@@ -89,11 +540,15 @@ int main(int argc, char ** argv) {
 
     params.cpuparams_batch.n_threads = params.speculative.cpuparams_batch.n_threads;
     params.tensor_buft_overrides     = params.speculative.tensor_buft_overrides;
+    const std::string kairox_ms_path   = params.kairox_ms_path;
+    params.kairox_ms_path              = "";
 
     auto llama_init_dft = common_init_from_params(params);
 
     model_dft = llama_init_dft->model();
     ctx_dft   = llama_init_dft->context();
+
+    kairox_init_from_model_and_ctx(model_tgt, ctx_tgt, model_dft, ctx_dft, kairox_ms_path.c_str(), params.vram_budget);
 
     const llama_vocab * vocab_tgt = llama_model_get_vocab(model_tgt);
     const llama_vocab * vocab_dft = llama_model_get_vocab(model_dft);
@@ -149,6 +604,121 @@ int main(int argc, char ** argv) {
 
     auto * mem_tgt = llama_get_memory(ctx_tgt);
     auto * mem_dft = llama_get_memory(ctx_dft);
+
+    const bool bench_mode = !params.bench_prompt_file.empty() || params.bench_runs > 1 || params.bench_warmup > 0;
+    if (bench_mode) {
+        auto bench_exit = [&](int code) {
+            llama_backend_free();
+            return code;
+        };
+
+        if (params.n_predict < 0) {
+            LOG_ERR("%s: benchmark mode requires --n-predict >= 0\n", __func__);
+            return bench_exit(1);
+        }
+
+        std::vector<std::string> bench_prompts;
+        if (!params.bench_prompt_file.empty()) {
+            bench_prompts = load_bench_prompts_from_file(params.bench_prompt_file);
+            if (bench_prompts.empty()) {
+                LOG_ERR("no prompts loaded from benchmark prompt file: '%s'\n", params.bench_prompt_file.c_str());
+                return bench_exit(1);
+            }
+        } else {
+            bench_prompts.push_back(params.prompt);
+        }
+
+        size_t target_runs = 0;
+        if (params.bench_prompt_file.empty()) {
+            target_runs = (size_t) params.bench_runs;
+        } else if (params.bench_runs_set) {
+            target_runs = (size_t) params.bench_runs;
+        } else {
+            target_runs = bench_prompts.size();
+        }
+
+        const int n_warmup = params.bench_warmup;
+        LOG_INF("benchmark mode: warmup = %d, target measured runs = %zu, prompts = %zu\n",
+                n_warmup, target_runs, bench_prompts.size());
+
+        for (int i = 0; i < n_warmup; ++i) {
+            speculative_bench_run_data warmup_data;
+            const std::string & prompt_run = bench_prompts[(size_t) i % bench_prompts.size()];
+            if (!speculative_bench_run_one(model_tgt, model_dft, ctx_tgt, ctx_dft, mem_tgt, mem_dft, vocab_tgt, params, n_seq_dft, p_draft_split, rng, u_dist, prompt_run, warmup_data)) {
+                return bench_exit(1);
+            }
+            LOG_INF("benchmark warmup %d/%d complete\n", i + 1, n_warmup);
+        }
+
+        std::vector<double> prefill_tps_values;
+        std::vector<double> decode_tps_values;
+        prefill_tps_values.reserve(target_runs);
+        decode_tps_values.reserve(target_runs);
+        const size_t max_attempts_without_progress = 10 * std::max(target_runs, bench_prompts.size());
+        size_t n_attempted = 0;
+        size_t n_attempted_since_include = 0;
+        size_t n_filtered = 0;
+        size_t n_included = 0;
+
+        while (n_included < target_runs) {
+            speculative_bench_run_data run_data;
+            const std::string & prompt_run = bench_prompts[n_attempted % bench_prompts.size()];
+            if (!speculative_bench_run_one(model_tgt, model_dft, ctx_tgt, ctx_dft, mem_tgt, mem_dft, vocab_tgt, params, n_seq_dft, p_draft_split, rng, u_dist, prompt_run, run_data)) {
+                return bench_exit(1);
+            }
+            ++n_attempted;
+
+            const double prefill_tps = run_data.t_prompt_us > 0 ? (1e6 * run_data.n_prompt / (double) run_data.t_prompt_us) : 0.0;
+            const double decode_tps  = run_data.t_decode_us > 0 ? (1e6 * run_data.n_decode / (double) run_data.t_decode_us) : 0.0;
+            const bool include_in_stats = run_data.n_decode >= 16;
+            if (!include_in_stats) {
+                ++n_filtered;
+                ++n_attempted_since_include;
+            } else {
+                ++n_included;
+                n_attempted_since_include = 0;
+            }
+
+            LOG("bench run attempt %zu (included %zu/%zu): prompt = %d tok, decode = %d tok, prefill = %.2f t/s, decode = %.2f t/s%s\n",
+                n_attempted, n_included, target_runs, run_data.n_prompt, run_data.n_decode, prefill_tps, decode_tps,
+                include_in_stats ? "" : " [filtered: decode < 16]");
+
+            if (include_in_stats) {
+                prefill_tps_values.push_back(prefill_tps);
+                decode_tps_values.push_back(decode_tps);
+            }
+
+            if (n_included < target_runs && n_attempted_since_include >= max_attempts_without_progress) {
+                LOG_WRN("benchmark stopped early after %zu consecutive filtered attempts without collecting a new measured run\n",
+                        n_attempted_since_include);
+                break;
+            }
+        }
+
+        LOG("\nbenchmark summary:\n");
+        LOG("  target measured runs: %zu\n", target_runs);
+        LOG("  attempted runs:       %zu\n", n_attempted);
+        LOG("  filtered runs (decode < 16): %zu\n", n_filtered);
+        LOG("  included runs:        %zu\n", n_included);
+
+        if (n_included < target_runs) {
+            LOG("  note: stopped before reaching the target because no new measured runs were collected for too many attempts\n");
+        }
+
+        if (decode_tps_values.empty()) {
+            LOG("  no runs passed the decode token filter\n");
+            return bench_exit(0);
+        }
+
+        const double mean_prefill_tps = std::accumulate(prefill_tps_values.begin(), prefill_tps_values.end(), 0.0) / prefill_tps_values.size();
+        const double mean_decode_tps  = std::accumulate(decode_tps_values.begin(), decode_tps_values.end(), 0.0) / decode_tps_values.size();
+
+
+        LOG("  prefill mean:   %.2f t/s\n", mean_prefill_tps);
+        LOG("  decode mean:    %.2f t/s\n", mean_decode_tps);
+
+        return bench_exit(0);
+    }
 
     // Tokenize the prompt
     std::vector<llama_token> inp;

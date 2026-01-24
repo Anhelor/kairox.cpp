@@ -12,6 +12,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
+#include "ggml-kairox.hpp"
 
 #include <assert.h>
 #include <limits.h>
@@ -20,6 +21,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <memory>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 #ifdef __APPLE__
@@ -307,6 +311,50 @@ void ggml_backend_tensor_get(const struct ggml_tensor * tensor, void * data, siz
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor read out of bounds");
 
     buf->iface.get_tensor(buf, tensor, data, offset, size);
+}
+
+static void kairox_backend_tensor_get_for_copy(ggml_tensor * tensor, void * data, bool async) {
+    GGML_ASSERT(tensor);
+    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+
+    size_t offset = 0;
+    size_t size   = ggml_nbytes(tensor);
+
+    if (size == 0) {
+        return;
+    }
+
+    GGML_ASSERT(buf != NULL && "tensor buffer not set");
+    GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
+    GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
+
+    if (async) {
+        buf->iface.get_tensor_async(buf, tensor, data, offset, size);
+    } else {
+        buf->iface.get_tensor(buf, tensor, data, offset, size);
+    }
+}
+
+static void kairox_backend_tensor_set_for_copy(ggml_tensor * tensor, void * data, bool async) {
+    GGML_ASSERT(tensor);
+    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+
+    size_t offset = 0;
+    size_t size   = ggml_nbytes(tensor);
+
+    if (size == 0) {
+        return;
+    }
+
+    GGML_ASSERT(buf != NULL && "tensor buffer not set");
+    GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
+    GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
+
+    if (async) {
+        buf->iface.set_tensor_async(buf, tensor, data, offset, size);
+    } else {
+        buf->iface.set_tensor(buf, tensor, data, offset, size);
+    }
 }
 
 void ggml_backend_tensor_memset(struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
@@ -613,6 +661,8 @@ static const struct ggml_backend_buffer_i ggml_backend_multi_buffer_i = {
     /* .cpy_tensor      = */ NULL,
     /* .clear           = */ ggml_backend_multi_buffer_clear,
     /* .reset           = */ NULL,
+    /* .set_tensor_async= */ NULL,
+    /* .get_tensor_async= */ NULL,
 };
 
 ggml_backend_buffer_t ggml_backend_multi_buffer_alloc_buffer(ggml_backend_buffer_t * buffers, size_t n_buffers) {
@@ -696,6 +746,9 @@ struct ggml_backend_sched {
     struct ggml_hash_set  hash_set;
     int                 * hv_tensor_backend_ids; // [hash_set.size]
     struct ggml_tensor ** hv_tensor_copies;      // [hash_set.size][n_backends][n_copies]
+
+    std::unique_ptr<std::unordered_map<std::string, ggml_backend_event_t>> kairox_events;
+    std::unique_ptr<SingleThreadExecutor>                                  kairox_executor;
 
     int * node_backend_ids; // [graph_size]
     int * leaf_backend_ids; // [graph_size]
@@ -1180,6 +1233,19 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
             // check if we should start a new split based on the sources of the current node
             bool need_new_split = false;
+
+            auto * kairox_extra = (kairox_tensor_extra *) node->extra;
+            if (kairox_extra &&
+                (kairox_extra->split_flag == KAIROX_SPLIT_MUL_MAT_SPARSE || kairox_extra->split_flag == KAIROX_SPLIT_AXPY_SPARSE)) {
+                need_new_split = true;
+            }
+            if (i > 0) {
+                auto * kairox_extra_ = (kairox_tensor_extra *) graph->nodes[i - 1]->extra;
+                if (kairox_extra_ && kairox_extra_->split_flag == KAIROX_SPLIT_BREAK) {
+                    need_new_split = true;
+                }
+            }
+
             if (node_backend_id == cur_backend_id && split->n_inputs > 0) {
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     struct ggml_tensor * src = node->src[j];
@@ -1442,6 +1508,55 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+static inline kairox_tensor_extra * get_extra(ggml_backend_sched_t sched, ggml_tensor * tensor) {
+    if (!tensor->extra) {
+        auto * kairox_extra         = (kairox_tensor_extra *) calloc(1, sizeof(kairox_tensor_extra));
+        kairox_extra->kairox_executor = (void *) sched->kairox_executor.get();
+        tensor->extra             = kairox_extra;
+    }
+    return (kairox_tensor_extra *) tensor->extra;
+}
+
+static inline void kairox_append_event(ggml_backend_sched_t        sched,
+                                           ggml_tensor *               tensor,
+                                           enum kairox_event_state state,
+                                           ggml_backend_event_t        event) {
+    auto * kairox_extra = get_extra(sched, tensor);
+    GGML_ASSERT(kairox_extra->event_count < GGML_MAX_SRC);
+    kairox_extra->states[kairox_extra->event_count]   = state;
+    kairox_extra->events[kairox_extra->event_count++] = event;
+}
+
+void kairox_set_node_state(ggml_backend_sched_t       sched,
+                               ggml_tensor *              tensor,
+                               enum kairox_split_flag split_flag) {
+    if (!k_enable_kairox_parallel) {
+        return;
+    }
+
+    auto * kairox_extra      = get_extra(sched, tensor);
+    kairox_extra->split_flag = split_flag;
+}
+
+void kairox_register_dependency(ggml_backend_sched_t        sched,
+                                    ggml_tensor *               src,
+                                    ggml_tensor *               dst,
+                                    ggml_backend_t              event_backend,
+                                    enum kairox_event_state src_state,
+                                    enum kairox_event_state dst_state) {
+    if (!k_enable_kairox_parallel) {
+        return;
+    }
+
+    const std::string event_key = std::string(src->name) + " + " + dst->name;
+    if (sched->kairox_events->find(event_key) == sched->kairox_events->end()) {
+        (*sched->kairox_events)[event_key] = ggml_backend_event_new(event_backend->device);
+    }
+    ggml_backend_event_t event = (*sched->kairox_events)[event_key];
+    kairox_append_event(sched, src, src_state, event);
+    kairox_append_event(sched, dst, dst_state, event);
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1449,11 +1564,45 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
+    std::future<enum ggml_status> split_fut;
+    enum kairox_split_flag async_split_fut_flag = KAIROX_SPLIT_NONE;
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+
+        if (k_enable_kairox_parallel && split_fut.valid() &&
+            ggml_backend_dev_type(split_backend->device) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            enum ggml_status async_ec = split_fut.get();
+            if (async_ec != GGML_STATUS_SUCCESS) {
+                return async_ec;
+            }
+            async_split_fut_flag = KAIROX_SPLIT_NONE;
+        }
+
+        bool skip_backend_sync = false;
+        if (k_enable_kairox_parallel && ggml_backend_dev_type(split_backend->device) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            bool waited_for_async_ec = false;
+            for (int node_id = 0; node_id < split->graph.n_nodes; ++node_id) {
+                if (auto * kairox_extra = (kairox_tensor_extra *) split->graph.nodes[node_id]->extra; kairox_extra) {
+                    for (int k = 0; k < kairox_extra->event_count; ++k) {
+                        if (kairox_extra->states[k] == KAIROX_EVENT_SYNCHRONIZE) {
+                            if (!waited_for_async_ec && split_fut.valid() && async_split_fut_flag == KAIROX_SPLIT_AXPY_SPARSE) {
+                                enum ggml_status async_ec = split_fut.get();
+                                if (async_ec != GGML_STATUS_SUCCESS) {
+                                    return async_ec;
+                                }
+                                waited_for_async_ec  = true;
+                                async_split_fut_flag = KAIROX_SPLIT_NONE;
+                            }
+                            ggml_backend_event_synchronize(kairox_extra->events[k]);
+                            skip_backend_sync = true;
+                        }
+                    }
+                }
+            }
+        }
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1469,6 +1618,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ggml_backend_synchronize(split_backend);
                 }
                 ggml_backend_tensor_copy(input, input_cpy);
+            } else if (skip_backend_sync) {
+                kairox_backend_tensor_get_for_copy(input, input_cpy->data, input_id + 1 < split->n_inputs);
+                continue;
             } else {
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -1566,22 +1718,37 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
-                        ggml_backend_synchronize(input_backend);
-                        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                            ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                        if (!k_enable_kairox_parallel) {
+                            ggml_backend_synchronize(input_backend);
+                            if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                                ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                            } else {
+                                ggml_backend_synchronize(split_backend);
+                            }
+                            ggml_backend_tensor_copy(input, input_cpy);
                         } else {
-                            ggml_backend_synchronize(split_backend);
+                            kairox_backend_tensor_set_for_copy(input_cpy, input->data, input_id + 1 < split->n_inputs);
                         }
-                        ggml_backend_tensor_copy(input, input_cpy);
                     }
                 }
             }
         }
 
         if (!sched->callback_eval) {
-            enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
-            if (ec != GGML_STATUS_SUCCESS) {
-                return ec;
+            auto * kairox_extra = (kairox_tensor_extra *) split->graph.nodes[0]->extra;
+            if (k_enable_kairox_parallel && kairox_extra && kairox_extra->split_flag == KAIROX_SPLIT_MUL_MAT_SPARSE) {
+                split_fut = sched->kairox_executor->submit(SingleThreadExecutor::KairoxWaitType::KAIROX_WAIT_MUL_MAT_SPARSE,
+                                                         ggml_backend_graph_compute_async, split_backend, &split->graph);
+                async_split_fut_flag = KAIROX_SPLIT_MUL_MAT_SPARSE;
+            } else if (k_enable_kairox_parallel && kairox_extra && kairox_extra->split_flag == KAIROX_SPLIT_AXPY_SPARSE) {
+                split_fut = sched->kairox_executor->submit(SingleThreadExecutor::KairoxWaitType::KAIROX_WAIT_AXPY_SPARSE,
+                                                         ggml_backend_graph_compute_async, split_backend, &split->graph);
+                async_split_fut_flag = KAIROX_SPLIT_AXPY_SPARSE;
+            } else {
+                enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+                if (ec != GGML_STATUS_SUCCESS) {
+                    return ec;
+                }
             }
         } else {
             // similar to ggml_backend_compare_graph_backend
@@ -1625,6 +1792,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
     }
 
+    if (k_enable_kairox_parallel && split_fut.valid()) {
+        enum ggml_status async_ec = split_fut.get();
+        if (async_ec != GGML_STATUS_SUCCESS) {
+            return async_ec;
+        }
+        async_split_fut_flag = KAIROX_SPLIT_NONE;
+    }
+
     return GGML_STATUS_SUCCESS;
 }
 
@@ -1653,6 +1828,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
+    if (k_enable_kairox_parallel) {
+        sched->kairox_events = std::make_unique<std::unordered_map<std::string, ggml_backend_event_t>>();
+        sched->kairox_executor = std::make_unique<SingleThreadExecutor>();
+    }
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
@@ -1700,6 +1879,13 @@ ggml_backend_sched_t ggml_backend_sched_new(
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
+    }
+    if (k_enable_kairox_parallel) {
+        for (auto & it : *sched->kairox_events) {
+            ggml_backend_event_free(it.second);
+        }
+        sched->kairox_executor.reset();
+        sched->kairox_events.reset();
     }
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
@@ -2177,6 +2363,8 @@ static const struct ggml_backend_buffer_i ggml_backend_cpu_buffer_i = {
     /* .cpy_tensor      = */ ggml_backend_cpu_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_cpu_buffer_clear,
     /* .reset           = */ NULL,
+    /* .set_tensor_async= */ NULL,
+    /* .get_tensor_async= */ NULL,
 };
 
 static const struct ggml_backend_buffer_i ggml_backend_cpu_buffer_from_ptr_i = {
@@ -2189,6 +2377,8 @@ static const struct ggml_backend_buffer_i ggml_backend_cpu_buffer_from_ptr_i = {
     /* .cpy_tensor      = */ ggml_backend_cpu_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_cpu_buffer_clear,
     /* .reset           = */ NULL,
+    /* .set_tensor_async= */ NULL,
+    /* .get_tensor_async= */ NULL,
 };
 
 // CPU backend buffer type

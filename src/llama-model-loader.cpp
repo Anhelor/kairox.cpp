@@ -514,6 +514,7 @@ llama_model_loader::llama_model_loader(
         const std::string & fname,
         std::vector<std::string> & splits,
         FILE * file,
+        bool use_kairox,
         bool use_mmap,
         bool use_direct_io,
         bool check_tensors,
@@ -812,6 +813,7 @@ llama_model_loader::llama_model_loader(
         use_mmap = false;
     }
 
+    this->use_kairox = use_kairox;
     this->use_mmap = use_mmap;
     this->use_direct_io = use_direct_io;
     this->check_tensors = check_tensors;
