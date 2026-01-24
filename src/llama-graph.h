@@ -20,6 +20,12 @@ struct llama_cparams;
 
 struct llama_memory_context_i;
 
+struct llama_model;
+struct llama_layer;
+
+struct kairox_cache_manager;
+struct kairox_layer_cache;
+
 class llama_kv_cache_context;
 class llama_kv_cache_iswa_context;
 class llama_memory_recurrent_context;
@@ -37,6 +43,8 @@ enum llm_ffn_op_type {
     LLM_FFN_SILU,
     LLM_FFN_GELU,
     LLM_FFN_RELU,
+    LLM_FFN_FATRELU,
+    LLM_FFN_DRELU,
     LLM_FFN_RELU_SQR,
     LLM_FFN_SWIGLU,
     LLM_FFN_GEGLU,
@@ -538,6 +546,7 @@ struct llm_graph_params {
 
     ggml_backend_sched_t sched;
     ggml_backend_t backend_cpu;
+    ggml_backend_t backend_gpu;
 
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
@@ -566,6 +575,9 @@ struct llm_graph_params {
     llm_graph_cb cb;
 
     llm_graph_result * res;
+
+    // kairox
+    kairox_cache_manager * kairox_cm = nullptr;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -746,6 +758,7 @@ struct llm_graph_context {
     ggml_backend_sched_t sched;
 
     ggml_backend_t backend_cpu; // TODO: needed by build_attn_mha, figure out a way to remove?
+    ggml_backend_t backend_gpu;
 
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
@@ -765,6 +778,9 @@ struct llm_graph_context {
     virtual ~llm_graph_context() = default;
 
     void cb(ggml_tensor * cur, const char * name, int il) const;
+
+    // kairox
+    kairox_cache_manager * kairox_cm = nullptr;
 
     //
     // common
@@ -808,6 +824,59 @@ struct llm_graph_context {
          llm_ffn_op_type   type_op,
        llm_ffn_gate_type   type_gate,
                      int   il) const;
+
+    ggml_tensor * build_predictor(
+             ggml_tensor * cur,
+             ggml_tensor * pred_up,
+             ggml_tensor * pred_up_b,
+             ggml_tensor * pred_down,
+             ggml_tensor * pred_down_b,
+                     int   il) const;
+
+    ggml_tensor * build_mm_sparse(
+             ggml_tensor * a,
+             ggml_tensor * b,
+             ggml_tensor * sparse_idx,
+             ggml_tensor * neu_info,
+                    bool   gpu_mm_sparse,
+                    bool   gpu_only,
+                   float   threshold) const;
+
+    ggml_tensor * build_sparse_ffn(
+                   ggml_tensor * cur,
+                   ggml_tensor * inp_out_ids,
+             const llama_model * model,
+                           int   il) const;
+
+    ggml_tensor * build_kairox_or_ffn(
+                   ggml_tensor * cur,
+                   ggml_tensor * inp_out_ids,
+             const llama_model * model,
+                           int   il,
+                   ggml_tensor * up,
+                   ggml_tensor * up_b,
+                   ggml_tensor * up_s,
+                   ggml_tensor * gate,
+                   ggml_tensor * gate_b,
+                   ggml_tensor * gate_s,
+                   ggml_tensor * down_b,
+                   ggml_tensor * down_s,
+                   ggml_tensor * act_scales,
+               llm_ffn_op_type   type_op,
+             llm_ffn_gate_type   type_gate) const;
+
+    void build_sparse_ffn_dfr(
+        kairox_layer_cache *  lc,
+                   ggml_tensor *& load_group,
+                   ggml_tensor *& evict_group,
+                          float   threshold,
+                            int   il) const;
+
+    ggml_tensor * build_sparse_ffn_hidden(
+                   ggml_tensor *& cur_up,
+                   ggml_tensor *& cur_gate,
+                       llm_arch    arch,
+                            int    il) const;
 
     // build MoE FFN without bias tensors
     ggml_tensor * build_moe_ffn(

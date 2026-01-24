@@ -480,6 +480,10 @@ struct common_params {
     bool        save_logits       = false;  // whether to save logits to files                              // NOLINT
     std::vector<std::string> tensor_filter; // filter tensor names for debug output (regex)                 // NOLINT
 
+    // kairox specific options
+    std::string kairox_ms_path;
+    int64_t     vram_budget = 0;
+
     std::vector<std::string> in_files;   // all input files
     std::vector<std::string> antiprompt; // strings upon which more user input is prompted (a.k.a. reverse prompts)
     std::vector<llama_model_kv_override> kv_overrides;
@@ -672,6 +676,14 @@ struct common_params {
 
     // batched-bench params
     bool batched_bench_output_jsonl = false;
+
+    // benchmark params (completion/speculative)
+    int32_t     bench_runs          = 1;
+    int32_t     bench_warmup        = 0;
+    bool        bench_runs_set      = false;
+    bool        bench_no_print      = false;
+    bool        bench_token_latency = false;
+    std::string bench_prompt_file;
 
     // common params
     std::string out_file; // output filename for all example programs
@@ -974,6 +986,13 @@ const char * const LLM_KV_SPLIT_NO            = "split.no";
 const char * const LLM_KV_SPLIT_COUNT         = "split.count";
 const char * const LLM_KV_SPLIT_TENSORS_COUNT = "split.tensors.count";
 
+}
+
+// only match the ffn weights (not including the bias) in kairox
+const char * const LLM_FFN_REGEX = "\\.ffn_(up|gate|down|down_t)\\.weight";
+
+static llama_model_tensor_buft_override llm_ffn_cpu_override() {
+    return { LLM_FFN_REGEX, ggml_backend_cpu_buffer_type() };
 }
 
 //

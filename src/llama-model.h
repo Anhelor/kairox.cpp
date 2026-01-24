@@ -278,9 +278,16 @@ struct llama_layer {
     struct ggml_tensor * ffn_norm_exps    = nullptr;
     struct ggml_tensor * ffn_norm_enc     = nullptr;
 
+    // predictor
+    struct ggml_tensor * ffn_pred_up     = nullptr;
+    struct ggml_tensor * ffn_pred_down   = nullptr;
+    struct ggml_tensor * ffn_pred_up_b   = nullptr;
+    struct ggml_tensor * ffn_pred_down_b = nullptr;
+
     // ff
     struct ggml_tensor * ffn_gate     = nullptr; // w1
     struct ggml_tensor * ffn_down     = nullptr; // w2
+    struct ggml_tensor * ffn_down_t   = nullptr; // w2.T
     struct ggml_tensor * ffn_up       = nullptr; // w3
     struct ggml_tensor * ffn_gate_enc = nullptr;
     struct ggml_tensor * ffn_down_enc = nullptr;
@@ -612,9 +619,9 @@ struct llama_model {
     // TODO: move this to new llm_arch_model_i interface
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
 
-private:
     llama_model_params params;
 
+private:
     struct impl;
     std::unique_ptr<impl> pimpl;
 };

@@ -1,3 +1,4 @@
+#include "ggml-kairox.hpp"
 #include "binbcast.cuh"
 #include <cstdint>
 #include <utility>
@@ -21,6 +22,24 @@ static __device__ __forceinline__ float op_mul(const float a, const float b) {
 
 static __device__ __forceinline__ float op_div(const float a, const float b) {
     return a / b;
+}
+
+__device__ __constant__ float dfr_ema_coeffs[3];
+
+static __device__ __forceinline__ float op_scale_add_ema(const float a, const float b) {
+    return dfr_ema_coeffs[0] * a + dfr_ema_coeffs[1] * (b / dfr_ema_coeffs[2]);
+}
+
+static __device__ __forceinline__ float op_scale_add(const float a, const float b) {
+    return dfr_ema_coeffs[0] * a + (b / dfr_ema_coeffs[2]);
+}
+
+static __device__ __forceinline__ float op_xor(const float a, const float b) {
+    return __int2float_rz(__float2int_rz(a) ^ __float2int_rz(b));
+}
+
+static __device__ __forceinline__ float op_and(const float a, const float b) {
+    return __int2float_rz(__float2int_rz(a) & __float2int_rz(b));
 }
 
 template <float (*bin_op)(const float, const float),
@@ -408,6 +427,24 @@ void ggml_cuda_op_mul(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
 void ggml_cuda_op_div(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_div>>(dst->src[0], dst->src[1], dst, dst->src[0]->data, dst->src[1]->data, dst->data, ctx.stream());
+}
+
+void ggml_cuda_op_scale_add(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    void * src_ptr = nullptr;
+    memcpy((void *) &src_ptr, &(dst->op_params[0]), sizeof(void *));
+    CUDA_CHECK(
+        cudaMemcpyToSymbolAsync(dfr_ema_coeffs, src_ptr, 3 * sizeof(float), 0, cudaMemcpyHostToDevice, ctx.stream()));
+
+    ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_scale_add_ema>>(dst->src[0], dst->src[1], dst, dst->src[0]->data,
+                                                             dst->src[1]->data, dst->data, ctx.stream());
+}
+
+void ggml_cuda_op_xor(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_xor>>(dst->src[0], dst->src[1], dst, dst->src[0]->data, dst->src[1]->data, dst->data, ctx.stream());
+}
+
+void ggml_cuda_op_and(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_and>>(dst->src[0], dst->src[1], dst, dst->src[0]->data, dst->src[1]->data, dst->data, ctx.stream());
 }
 
 template <float (*op)(const float, const float), int n_fuse>

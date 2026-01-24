@@ -340,6 +340,23 @@ extern "C" {
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
+    // Kairox: data structures and functions used by async split scheduling.
+    enum kairox_event_state { KAIROX_EVENT_RECORD = 1, KAIROX_EVENT_WAIT, KAIROX_EVENT_SYNCHRONIZE };
+
+    enum kairox_split_flag { KAIROX_SPLIT_NONE = 0, KAIROX_SPLIT_MUL_MAT_SPARSE, KAIROX_SPLIT_AXPY_SPARSE, KAIROX_SPLIT_BREAK };
+
+    typedef struct kairox_tensor_extra {
+        enum kairox_event_state states[GGML_MAX_SRC];
+        ggml_backend_event_t        events[GGML_MAX_SRC];
+        int                         event_count;
+        enum kairox_split_flag  split_flag;
+        void *                      kairox_executor;
+    } kairox_tensor_extra;
+
+    GGML_API void kairox_register_dependency(ggml_backend_sched_t sched, struct ggml_tensor * src, struct ggml_tensor * dst, ggml_backend_t event_backend, enum kairox_event_state src_state, enum kairox_event_state dst_state);
+
+    GGML_API void kairox_set_node_state(ggml_backend_sched_t sched, struct ggml_tensor * tensor, enum kairox_split_flag split_flag);
+
     //
     // Utils
     //

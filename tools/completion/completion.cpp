@@ -6,12 +6,14 @@
 #include "llama.h"
 #include "chat.h"
 
+#include <algorithm>
 #include <clocale>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <fstream>
 #include <iostream>
+#include <numeric>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -61,6 +63,139 @@ static bool file_is_empty(const std::string & path) {
     f.exceptions(std::ifstream::failbit | std::ifstream::badbit);
     f.open(path.c_str(), std::ios::in | std::ios::binary | std::ios::ate);
     return f.tellg() == 0;
+}
+
+struct completion_bench_run_data {
+    int32_t n_prompt = 0;
+    double  t_prompt_ms = 0.0;
+    int32_t n_decode = 0;
+    double  t_decode_ms = 0.0;
+    std::vector<double> token_latency_ms;
+};
+
+static std::vector<std::string> load_bench_prompts_from_file(const std::string & path) {
+    std::vector<std::string> prompts;
+    std::ifstream file(path);
+    if (!file) {
+        LOG_ERR("failed to open benchmark prompt file: '%s'\n", path.c_str());
+        return prompts;
+    }
+
+    std::string line;
+    while (std::getline(file, line)) {
+        if (!line.empty()) {
+            prompts.push_back(std::move(line));
+        }
+    }
+
+    return prompts;
+}
+
+static bool completion_bench_run_one(
+           llama_context *               ctx,
+             llama_model *             model,
+            llama_memory_t               mem,
+      const llama_vocab *             vocab,
+          common_sampler *              smpl,
+      const common_params &            params,
+      const std::string &              prompt,
+                     bool             add_bos,
+    completion_bench_run_data &          out) {
+    std::vector<llama_token> embd_inp = common_tokenize(ctx, prompt, true, true);
+
+    if (embd_inp.empty()) {
+        if (add_bos) {
+            embd_inp.push_back(llama_vocab_bos(vocab));
+        } else {
+            LOG_ERR("benchmark prompt is empty\n");
+            return false;
+        }
+    }
+
+    const int n_ctx = llama_n_ctx(ctx);
+    if ((int) embd_inp.size() > n_ctx - 4) {
+        LOG_ERR("benchmark prompt is too long (%d tokens, max %d)\n", (int) embd_inp.size(), n_ctx - 4);
+        return false;
+    }
+
+    llama_memory_clear(mem, true);
+    common_sampler_reset(smpl);
+    llama_perf_context_reset(ctx);
+
+    if (llama_model_has_encoder(model)) {
+        int enc_input_size = embd_inp.size();
+        llama_token * enc_input_buf = embd_inp.data();
+
+        if (llama_encode(ctx, llama_batch_get_one(enc_input_buf, enc_input_size))) {
+            LOG_ERR("%s : failed to eval\n", __func__);
+            return false;
+        }
+
+        llama_token decoder_start_token_id = llama_model_decoder_start_token(model);
+        if (decoder_start_token_id == LLAMA_TOKEN_NULL) {
+            decoder_start_token_id = llama_vocab_bos(vocab);
+        }
+
+        embd_inp.clear();
+        embd_inp.push_back(decoder_start_token_id);
+    }
+
+    int n_past = 0;
+    int n_consumed = 0;
+    int n_remain = params.n_predict;
+
+    std::vector<llama_token> embd;
+
+    while (n_consumed < (int) embd_inp.size() || n_remain != 0) {
+        embd.clear();
+
+        if (n_consumed < (int) embd_inp.size()) {
+            while (n_consumed < (int) embd_inp.size() && (int) embd.size() < params.n_batch) {
+                const llama_token id = embd_inp[n_consumed++];
+                embd.push_back(id);
+                common_sampler_accept(smpl, id, /* accept_grammar= */ false);
+            }
+        } else {
+            const llama_token id = common_sampler_sample(smpl, ctx, -1);
+            common_sampler_accept(smpl, id, /* accept_grammar= */ true);
+            embd.push_back(id);
+            n_remain--;
+
+            if (!params.bench_no_print) {
+                LOG("%s", common_token_to_piece(ctx, id, params.special).c_str());
+            }
+        }
+
+        if (n_past + (int) embd.size() >= n_ctx) {
+            LOG_WRN("%s: benchmark context full => stopping run\n", __func__);
+            break;
+        }
+
+        const bool is_decode_token = n_consumed >= (int) embd_inp.size();
+        const int64_t t_decode_start_us = is_decode_token && params.bench_token_latency ? ggml_time_us() : 0;
+        if (!common_prompt_batch_decode(ctx, embd, n_past, params.n_batch, "", false)) {
+            return false;
+        }
+        if (t_decode_start_us != 0) {
+            out.token_latency_ms.push_back(1e-3 * (ggml_time_us() - t_decode_start_us));
+        }
+
+        if (n_consumed >= (int) embd_inp.size() && !embd.empty() && llama_vocab_is_eog(vocab, embd.back())) {
+            break;
+        }
+    }
+
+    if (!params.bench_no_print) {
+        LOG("\n");
+    }
+
+    const llama_perf_context_data data = llama_perf_context(ctx);
+    out.n_prompt    = data.n_p_eval;
+    out.t_prompt_ms = data.t_p_eval_ms;
+    out.n_decode    = data.n_eval;
+    out.t_decode_ms = data.t_eval_ms;
+
+    return true;
 }
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__)) || defined (_WIN32)
@@ -147,6 +282,8 @@ int main(int argc, char ** argv) {
     ctx   = llama_init->context();
     model = llama_init->model();
     smpl  = llama_init->sampler(0);
+
+    kairox_init_from_model_and_ctx(model, ctx, nullptr, nullptr, params.kairox_ms_path.c_str(), params.vram_budget);
 
     if (ctx == NULL) {
         LOG_ERR("%s: error: unable to create context\n", __func__);
@@ -246,6 +383,148 @@ int main(int argc, char ** argv) {
         LOG_INF("\n");
     }
 
+    const bool add_bos = llama_vocab_get_add_bos(vocab) && !params.use_jinja;
+    if (!llama_model_has_encoder(model)) {
+        GGML_ASSERT(!llama_vocab_get_add_eos(vocab));
+    }
+
+    const bool bench_mode = !params.bench_prompt_file.empty() || params.bench_runs > 1 || params.bench_warmup > 0;
+    if (bench_mode) {
+        auto bench_exit = [&](int code) {
+            llama_backend_free();
+            ggml_threadpool_free_fn(threadpool);
+            ggml_threadpool_free_fn(threadpool_batch);
+            return code;
+        };
+
+        if (params.n_predict < 0) {
+            LOG_ERR("benchmark mode requires --n-predict >= 0\n");
+            return bench_exit(1);
+        }
+
+        if (params.bench_token_latency) {
+            if (params.bench_runs != 1) {
+                LOG_ERR("--bench-token-latency requires --bench-runs 1\n");
+                return bench_exit(1);
+            }
+            if (!params.bench_prompt_file.empty()) {
+                LOG_ERR("--bench-token-latency does not support --bench-prompt-file\n");
+                return bench_exit(1);
+            }
+        }
+
+        std::vector<std::string> bench_prompts;
+        if (!params.bench_prompt_file.empty()) {
+            bench_prompts = load_bench_prompts_from_file(params.bench_prompt_file);
+            if (bench_prompts.empty()) {
+                LOG_ERR("no prompts loaded from benchmark prompt file: '%s'\n", params.bench_prompt_file.c_str());
+                return bench_exit(1);
+            }
+        } else {
+            bench_prompts.push_back(params.prompt);
+        }
+
+        size_t target_runs = 0;
+        if (params.bench_prompt_file.empty()) {
+            target_runs = (size_t) params.bench_runs;
+        } else if (params.bench_runs_set) {
+            target_runs = (size_t) params.bench_runs;
+        } else {
+            target_runs = bench_prompts.size();
+        }
+
+        const int n_warmup = params.bench_warmup;
+        LOG_INF("benchmark mode: warmup = %d, target measured runs = %zu, prompts = %zu\n",
+                n_warmup, target_runs, bench_prompts.size());
+
+        for (int i = 0; i < n_warmup; ++i) {
+            completion_bench_run_data warmup_data;
+            const std::string & prompt_run = bench_prompts[(size_t) i % bench_prompts.size()];
+            if (!completion_bench_run_one(ctx, model, mem, vocab, smpl, params, prompt_run, add_bos, warmup_data)) {
+                return bench_exit(1);
+            }
+            LOG_INF("benchmark warmup %d/%d complete\n", i + 1, n_warmup);
+        }
+
+        std::vector<double> prefill_tps_values;
+        std::vector<double> decode_tps_values;
+        prefill_tps_values.reserve(target_runs);
+        decode_tps_values.reserve(target_runs);
+        const size_t max_attempts_without_progress = 10 * std::max(target_runs, bench_prompts.size());
+        size_t n_attempted = 0;
+        size_t n_attempted_since_include = 0;
+        size_t n_filtered = 0;
+        size_t n_included = 0;
+
+        while (n_included < target_runs) {
+            completion_bench_run_data run_data;
+            const std::string & prompt_run = bench_prompts[n_attempted % bench_prompts.size()];
+            if (!completion_bench_run_one(ctx, model, mem, vocab, smpl, params, prompt_run, add_bos, run_data)) {
+                return bench_exit(1);
+            }
+            ++n_attempted;
+
+            const double prefill_tps = run_data.t_prompt_ms > 0.0 ? (1000.0 * run_data.n_prompt / run_data.t_prompt_ms) : 0.0;
+            const double decode_tps  = run_data.t_decode_ms > 0.0 ? (1000.0 * run_data.n_decode / run_data.t_decode_ms) : 0.0;
+
+            const bool include_in_stats = run_data.n_decode >= 16;
+            if (!include_in_stats) {
+                ++n_filtered;
+                ++n_attempted_since_include;
+            } else {
+                ++n_included;
+                n_attempted_since_include = 0;
+            }
+
+            LOG("bench run attempt %zu (included %zu/%zu): prompt = %d tok, decode = %d tok, prefill = %.2f t/s, decode = %.2f t/s%s\n",
+                    n_attempted, n_included, target_runs, run_data.n_prompt, run_data.n_decode, prefill_tps, decode_tps,
+                    include_in_stats ? "" : " [filtered: decode < 16]");
+
+            if (include_in_stats) {
+                prefill_tps_values.push_back(prefill_tps);
+                decode_tps_values.push_back(decode_tps);
+            }
+
+            if (params.bench_token_latency && !run_data.token_latency_ms.empty()) {
+                LOG("  token latency ms: [");
+                for (size_t j = 0; j < run_data.token_latency_ms.size(); ++j) {
+                    LOG("%s%.3f", j == 0 ? "" : ", ", run_data.token_latency_ms[j]);
+                }
+                LOG("]\n");
+            }
+
+            if (n_included < target_runs && n_attempted_since_include >= max_attempts_without_progress) {
+                LOG_WRN("benchmark stopped early after %zu consecutive filtered attempts without collecting a new measured run\n",
+                        n_attempted_since_include);
+                break;
+            }
+        }
+
+        LOG("\nbenchmark summary:\n");
+        LOG("  target measured runs: %zu\n", target_runs);
+        LOG("  attempted runs:       %zu\n", n_attempted);
+        LOG("  filtered runs (decode < 16): %zu\n", n_filtered);
+        LOG("  included runs:        %zu\n", n_included);
+
+        if (n_included < target_runs) {
+            LOG("  note: stopped before reaching the target because no new measured runs were collected for too many attempts\n");
+        }
+
+        if (decode_tps_values.empty()) {
+            LOG("  no runs passed the decode token filter\n");
+            return bench_exit(0);
+        }
+
+        const double mean_prefill_tps = std::accumulate(prefill_tps_values.begin(), prefill_tps_values.end(), 0.0) / prefill_tps_values.size();
+        const double mean_decode_tps  = std::accumulate(decode_tps_values.begin(), decode_tps_values.end(), 0.0) / decode_tps_values.size();
+
+
+        LOG("  prefill mean:   %.2f t/s\n", mean_prefill_tps);
+        LOG("  decode mean:    %.2f t/s\n", mean_decode_tps);
+
+        return bench_exit(0);
+    }
+
     std::string path_session = params.path_prompt_cache;
     std::vector<llama_token> session_tokens;
 
@@ -266,11 +545,6 @@ int main(int argc, char ** argv) {
             session_tokens.resize(n_token_count_out);
             LOG_INF("%s: loaded a session with prompt size of %d tokens\n", __func__, (int)session_tokens.size());
         }
-    }
-
-    const bool add_bos = llama_vocab_get_add_bos(vocab) && !params.use_jinja;
-    if (!llama_model_has_encoder(model)) {
-        GGML_ASSERT(!llama_vocab_get_add_eos(vocab));
     }
 
     LOG_DBG("n_ctx: %d, add_bos: %d\n", n_ctx, add_bos);

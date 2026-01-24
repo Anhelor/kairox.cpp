@@ -1393,6 +1393,48 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_excludes({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--bench-runs"}, "N",
+        "run benchmark mode until N unfiltered measured runs are collected (default: 1)",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.bench_runs = value;
+            params.bench_runs_set = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_SPECULATIVE}));
+    add_opt(common_arg(
+        {"--bench-warmup"}, "N",
+        "run N warmup iterations before measured benchmark runs (default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.bench_warmup = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_SPECULATIVE}));
+    add_opt(common_arg(
+        {"--bench-prompt-file"}, "FNAME",
+        "path to benchmark prompt file (one prompt per line)",
+        [](common_params & params, const std::string & value) {
+            params.bench_prompt_file = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_SPECULATIVE}));
+    add_opt(common_arg(
+        {"--bench-no-print"},
+        "disable per-token text output during benchmark runs",
+        [](common_params & params) {
+            params.bench_no_print = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_SPECULATIVE}));
+    add_opt(common_arg(
+        {"--bench-token-latency"},
+        "record and print per-token decode latency during benchmark runs",
+        [](common_params & params) {
+            params.bench_token_latency = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
         {"-sysf", "--system-prompt-file"}, "FNAME",
         "a file containing the system prompt (default: none)",
         [](common_params & params, const std::string & value) {
@@ -1553,7 +1595,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, bool value) {
             params.warmup = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_MTMD, LLAMA_EXAMPLE_EMBEDDING, LLAMA_EXAMPLE_RETRIEVAL, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_DEBUG}));
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_MTMD, LLAMA_EXAMPLE_EMBEDDING, LLAMA_EXAMPLE_RETRIEVAL, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_DEBUG}));
     add_opt(common_arg(
         {"--spm-infill"},
         string_format(
@@ -2285,6 +2327,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             parse_tensor_buffer_overrides(value, params.speculative.tensor_buft_overrides);
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"-kairox-ms", "--kairox-model-split"}, "FNAME",
+        "path to the model split file used by Kairox",
+        [](common_params & params, const std::string & value) {
+            params.kairox_ms_path = value;
+        }
+    ).set_env("LLAMA_ARG_KAIROX_MODEL_SPLIT"));
+    add_opt(common_arg(
+        {"-vb", "--vram-budget"}, "N",
+        "sets a memory budget (in GiB) on GPU for tensors; if set to 0, no explicit limit is applied",
+        [](common_params & params, int value) {
+            if (value < 0) { throw std::invalid_argument("invalid value"); }
+            params.vram_budget = value;
+        }
+    ).set_env("LLAMA_ARG_VRAM_BUDGET"));
+    add_opt(common_arg(
+        {"-cffn", "--cpu-ffn"},
+        "keep all Feed Forward Network (FFN) weights in the CPU",
+        [](common_params & params) {
+            params.tensor_buft_overrides.push_back(llm_ffn_cpu_override());
+        }
+    ).set_env("LLAMA_ARG_CPU_FFN"));
     add_opt(common_arg(
         {"-cmoe", "--cpu-moe"},
         "keep all Mixture of Experts (MoE) weights in the CPU",

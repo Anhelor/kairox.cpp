@@ -88,12 +88,16 @@ llm_build_qwen2::llm_build_qwen2(const llama_model & model, const llm_graph_para
                 LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
-        cur = build_ffn(cur,
+        llm_ffn_op_type ffn_op_type = LLM_FFN_SILU;
+        if (arch == LLM_ARCH_SPARSEQWEN2) {
+            ffn_op_type = LLM_FFN_DRELU;
+        }
+        cur = build_kairox_or_ffn(cur, inp_out_ids, &model, il,
                 model.layers[il].ffn_up,   NULL, NULL,
                 model.layers[il].ffn_gate, NULL, NULL,
-                model.layers[il].ffn_down, NULL, NULL,
+                NULL, NULL,
                 NULL,
-                LLM_FFN_SILU, LLM_FFN_PAR, il);
+                ffn_op_type, LLM_FFN_PAR);
         cb(cur, "ffn_out", il);
 
         cur = ggml_add(ctx0, cur, ffn_inp);

@@ -10,6 +10,9 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include "llama-model.h"
+#include "llama-kairox.h"
+
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -941,6 +944,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     rope_type        (hparams.rope_type),
     sched            (params.sched),
     backend_cpu      (params.backend_cpu),
+    backend_gpu      (params.backend_gpu),
     cvec             (params.cvec),
     loras            (params.loras),
     mctx             (params.mctx),
@@ -949,7 +953,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
-    gf               (res->get_gf()) {
+    gf               (res->get_gf()),
+    kairox_cm         (params.kairox_cm){
         res->set_params(params);
     }
 
@@ -1167,6 +1172,20 @@ ggml_tensor * llm_graph_context::build_ffn(
                 cur = ggml_relu(ctx0, cur);
                 cb(cur, "ffn_relu", il);
             } break;
+        case LLM_FFN_FATRELU:
+            {
+                GGML_ASSERT(gate && type_gate == LLM_FFN_PAR);
+                cur = ggml_fatrelu(ctx0, cur, 0.01, false);
+                cb(cur, "ffn_fatrelu", il);
+            } break;
+        case LLM_FFN_DRELU:
+            {
+                GGML_ASSERT(gate && type_gate == LLM_FFN_PAR);
+                tmp = ggml_relu(ctx0, tmp);
+                cb(tmp, "ffn_up_relu", il);
+                cur = ggml_relu(ctx0, cur);
+                cb(cur, "ffn_gate_relu", il);
+            } break;
         case LLM_FFN_RELU_SQR:
             {
                 cur = ggml_relu(ctx0, cur);
@@ -1221,6 +1240,333 @@ ggml_tensor * llm_graph_context::build_ffn(
     }
 
     return cur;
+}
+
+
+ggml_tensor * llm_graph_context::build_predictor(ggml_tensor * cur,
+                                                 ggml_tensor * pred_up,
+                                                 ggml_tensor * pred_up_b,
+                                                 ggml_tensor * pred_down,
+                                                 ggml_tensor * pred_down_b,
+                                                 int           il) const {
+    cur = ggml_mul_mat(ctx0, pred_up, cur);
+    cb(cur, "pred_up", il);
+
+    if (pred_up_b) {
+        cur = ggml_add(ctx0, cur, pred_up_b);
+        cb(cur, "pred_up_b", il);
+    }
+
+    cur = ggml_relu(ctx0, cur);
+    cb(cur, "pred_relu", il);
+
+    cur = ggml_mul_mat(ctx0, pred_down, cur);
+    cb(cur, "pred_down", il);
+
+    if (pred_down_b) {
+        cur = ggml_add(ctx0, cur, pred_down_b);
+        cb(cur, "pred_down_b", il);
+    }
+
+    cur = ggml_sigmoid(ctx0, cur);
+    cb(cur, "pred_out", il);
+
+    return cur;
+}
+
+ggml_tensor * llm_graph_context::build_mm_sparse(ggml_tensor * a,
+                                                 ggml_tensor * b,
+                                                 ggml_tensor * sparse_idx,
+                                                 ggml_tensor * neu_info,
+                                                 bool          gpu_mm_sparse,
+                                                 bool          gpu_only,
+                                                 float         threshold) const {
+    if (b->ne[1] <= 8 || !gpu_mm_sparse) {
+        return ggml_mul_mat_sparse(ctx0, a, b, sparse_idx, neu_info, threshold);
+    }
+
+    ggml_tensor * cur = ggml_mul_mat(ctx0, a, b);
+    if (!gpu_only) {
+        return ggml_scatter_rows(ctx0, cur, sparse_idx, neu_info);
+    }
+    return cur;
+}
+
+void llm_graph_context::build_sparse_ffn_dfr(kairox_layer_cache * lc,
+                                             ggml_tensor *&           load_group,
+                                             ggml_tensor *&           evict_group,
+                                             float                    threshold,
+                                             int                      il) const {
+    ggml_tensor * mask = ggml_shifted_step(ctx0, lc->sparse_idx, -threshold, false);
+    if (lc->sparse_idx->ne[1] > 1) {
+        mask = ggml_sum_cols(ctx0, mask);
+    }
+    ggml_tensor * deltas = ggml_transpose(
+        ctx0, ggml_sum_rows(ctx0, ggml_reshape_2d(ctx0, mask, lc->cache_shape.group_size, lc->cache_shape.n_groups)));
+    ggml_tensor * dfr_scores = ggml_scale_add(ctx0, lc->dfr_scores, deltas, (float *) lc->dfr_ema_coeffs->data,
+                                              (float) lc->sparse_idx->ne[1] * lc->cache_shape.group_size, true);
+    ggml_tensor * topk_idx   = ggml_argsort_top_k(ctx0, dfr_scores, lc->cache_shape.n_cached_groups);
+    ggml_tensor * topk_mask  = ggml_sum_cols(ctx0, ggml_get_rows(ctx0, kairox_cm->group_identity, topk_idx));
+    ggml_tensor * diff_mask  = ggml_xor(ctx0, lc->group_mask, topk_mask);
+
+    load_group = ggml_and(ctx0, topk_mask, diff_mask);
+    cb(load_group, "ffn_load_group", il);
+    ggml_build_forward_expand(gf, load_group);
+    evict_group = ggml_and(ctx0, lc->group_mask, diff_mask);
+    cb(evict_group, "ffn_evict_group", il);
+    ggml_build_forward_expand(gf, evict_group);
+    ggml_build_forward_expand(gf, ggml_cpy(ctx0, topk_mask, lc->group_mask));
+}
+
+ggml_tensor * llm_graph_context::build_sparse_ffn_hidden(ggml_tensor *& cur_up,
+                                                         ggml_tensor *& cur_gate,
+                                                         llm_arch       arch,
+                                                         int            il) const {
+    ggml_tensor * cur_hidden = nullptr;
+    switch (arch) {
+        case LLM_ARCH_PROSPARSE_LLAMA:
+            {
+                GGML_ASSERT(cur_gate && "FFN_GATE is not found");
+                cur_gate = ggml_fatrelu(ctx0, cur_gate, 0.01, false);
+                cb(cur_gate, "ffn_fatrelu", il);
+                cur_hidden = ggml_mul(ctx0, cur_gate, cur_up);
+                cb(cur_hidden, "ffn_gate_par", il);
+            }
+            break;
+        case LLM_ARCH_BAMBOO:
+        case LLM_ARCH_SPARSEQWEN2:
+            {
+                GGML_ASSERT(cur_gate && "FFN_GATE is not found");
+                cur_up = ggml_relu(ctx0, cur_up);
+                cb(cur_up, "ffn_up_relu", il);
+                cur_gate = ggml_relu(ctx0, cur_gate);
+                cb(cur_gate, "ffn_gate_relu", il);
+                cur_hidden = ggml_mul(ctx0, cur_gate, cur_up);
+                cb(cur_hidden, "ffn_gate_par", il);
+            }
+            break;
+        case LLM_ARCH_OPT:
+        case LLM_ARCH_RELUFALCON:
+            {
+                cur_hidden = ggml_relu(ctx0, cur_up);
+                cb(cur_hidden, "ffn_relu", il);
+            }
+            break;
+        default:
+            GGML_ABORT("Currently build_sparse_ffn does not support this model");
+    }
+    return cur_hidden;
+}
+
+ggml_tensor * llm_graph_context::build_sparse_ffn(ggml_tensor *       cur,
+                                                  ggml_tensor *       inp_out_ids,
+                                                  const llama_model * model,
+                                                  int                 il) const {
+    const bool  is_last           = (il == n_layer - 1);
+    auto *      first_kairox_lc   = kairox_cm->layer_caches[0];
+    auto *      kairox_lc         = kairox_cm->layer_caches[il];
+    auto *      next_kairox_lc    = is_last ? nullptr : kairox_cm->layer_caches[il + 1];
+    auto *      reload_kairox_lc  = !is_last ? next_kairox_lc : first_kairox_lc;
+    const int   reload_il         = !is_last ? il + 1 : 0;
+    const bool  build_reload_path = k_enable_kairox_parallel && reload_kairox_lc && !reload_kairox_lc->gpu_only;
+    const bool  mark_sparse_split = !kairox_lc->gpu_only || build_reload_path;
+    const float threshold         = kairox_cm->sparse_threshold;
+    bool        mark_axpy_split   = false;
+
+    ggml_tensor * load_group  = nullptr;
+    ggml_tensor * evict_group = nullptr;
+    ggml_tensor * sparse_idx  = kairox_lc->sparse_idx;
+    if (il == 0) {
+        sparse_idx = build_predictor(cur, kairox_lc->ffn_pred_up, kairox_lc->ffn_pred_up_b, kairox_lc->ffn_pred_down,
+                                     kairox_lc->ffn_pred_down_b, il);
+        ggml_build_forward_expand(gf, sparse_idx);
+        kairox_lc->sparse_idx = sparse_idx;
+    }
+    if (!is_last) {
+        ggml_tensor * next_sparse_idx =
+            build_predictor(cur, next_kairox_lc->ffn_pred_up, next_kairox_lc->ffn_pred_up_b,
+                            next_kairox_lc->ffn_pred_down, next_kairox_lc->ffn_pred_down_b, il + 1);
+        if (il + 1 == n_layer - 1 && inp_out_ids) {
+            next_sparse_idx = ggml_get_rows(ctx0, next_sparse_idx, inp_out_ids);
+        }
+        ggml_build_forward_expand(gf, next_sparse_idx);
+        next_kairox_lc->sparse_idx = next_sparse_idx;
+
+        if (build_reload_path) {
+            build_sparse_ffn_dfr(reload_kairox_lc, load_group, evict_group, threshold, il);
+        }
+    } else if (build_reload_path) {
+        build_sparse_ffn_dfr(reload_kairox_lc, load_group, evict_group, threshold, il);
+    }
+
+    ggml_tensor * up          = kairox_lc->ffn_up;
+    ggml_tensor * gate        = kairox_lc->ffn_gate;
+    ggml_tensor * down        = kairox_lc->ffn_down;
+    ggml_tensor * up_b        = kairox_lc->ffn_up_b;
+    ggml_tensor * gate_b      = kairox_lc->ffn_gate_b;
+    ggml_tensor * down_b      = kairox_lc->ffn_down_b;
+    ggml_tensor * gpu_up      = kairox_lc->ffn_up_cache;
+    ggml_tensor * gpu_gate    = kairox_lc->ffn_gate_cache;
+    ggml_tensor * gpu_down    = kairox_lc->ffn_down_cache;
+    ggml_tensor * neuron_idx  = kairox_lc->gpu_only ? nullptr : kairox_lc->neuron_idx;
+    ggml_tensor * neuron_mask = kairox_lc->gpu_only ? nullptr : kairox_lc->neuron_mask;
+
+    ggml_tensor * cur_up = build_mm_sparse(gpu_up, cur, sparse_idx, neuron_idx, true, kairox_lc->gpu_only, threshold);
+    cb(cur_up, "ffn_up_sparse_gpu", il);
+    ggml_build_forward_expand(gf, cur_up);
+    if (mark_sparse_split) {
+        ggml_tensor * split_anchor = cur_up;
+        if (split_anchor->op == GGML_OP_SCATTER_ROWS && split_anchor->src[0]) {
+            split_anchor = split_anchor->src[0];
+        }
+        kairox_set_node_state(sched, split_anchor, KAIROX_SPLIT_MUL_MAT_SPARSE);
+    }
+
+    ggml_tensor * cur_gate = nullptr;
+    if (gate) {
+        cur_gate = build_mm_sparse(gpu_gate, cur, sparse_idx, neuron_idx, true, kairox_lc->gpu_only, threshold);
+        cb(cur_gate, "ffn_gate_sparse_gpu", il);
+        ggml_build_forward_expand(gf, cur_gate);
+    }
+
+    ggml_tensor * cur_reload_plan = nullptr;
+    if (build_reload_path) {
+        cur_reload_plan = reload_kairox_lc->build_reload_plan(ctx0, load_group, evict_group);
+
+        ggml_tensor * cur_reload_gate = nullptr;
+        if (reload_kairox_lc->ffn_gate) {
+            cur_reload_gate = reload_kairox_lc->build_reload_exec(ctx0, cur_reload_plan, KAIROX_FFN_GATE);
+            cb(cur_reload_gate, "ffn_gate_reload", reload_il);
+            ggml_backend_sched_set_tensor_backend(sched, cur_reload_gate, backend_gpu);
+            ggml_build_forward_expand(gf, cur_reload_gate);
+            kairox_set_node_state(sched, cur_reload_gate, KAIROX_SPLIT_NONE);
+            reload_kairox_lc->reload_gate = cur_reload_gate;
+        }
+
+        cb(cur_reload_plan, "ffn_reload_plan", reload_il);
+        ggml_tensor * cur_reload_up = reload_kairox_lc->build_reload_exec(ctx0, cur_reload_plan, KAIROX_FFN_UP);
+        cb(cur_reload_up, "ffn_up_reload", reload_il);
+        ggml_backend_sched_set_tensor_backend(sched, cur_reload_up, backend_gpu);
+        ggml_build_forward_expand(gf, cur_reload_up);
+        kairox_set_node_state(sched, cur_reload_up, KAIROX_SPLIT_BREAK);
+        reload_kairox_lc->reload_up = cur_reload_up;
+    }
+
+    if (!kairox_lc->gpu_only) {
+        ggml_tensor * cur_up_cpu = build_mm_sparse(up, cur, sparse_idx, neuron_mask, false, false, threshold);
+        cb(cur_up_cpu, "ffn_up_sparse_cpu", il);
+        ggml_backend_sched_set_tensor_backend(sched, cur_up_cpu, backend_cpu);
+        ggml_build_forward_expand(gf, cur_up_cpu);
+        kairox_register_dependency(sched, cur, cur_up_cpu, backend_gpu, KAIROX_EVENT_RECORD, KAIROX_EVENT_SYNCHRONIZE);
+        if (il == 0) {
+            kairox_register_dependency(sched, sparse_idx, cur_up_cpu, backend_gpu, KAIROX_EVENT_RECORD,
+                                       KAIROX_EVENT_SYNCHRONIZE);
+        }
+
+        ggml_tensor * cur_gate_cpu = nullptr;
+        if (gate) {
+            cur_gate_cpu = build_mm_sparse(gate, cur, sparse_idx, neuron_mask, false, false, threshold);
+            cb(cur_gate_cpu, "ffn_gate_sparse_cpu", il);
+            ggml_backend_sched_set_tensor_backend(sched, cur_gate_cpu, backend_cpu);
+            ggml_build_forward_expand(gf, cur_gate_cpu);
+        }
+
+        cur_up = ggml_add(ctx0, cur_up, cur_up_cpu);
+        cb(cur_up, "ffn_up_sparse_merge", il);
+        ggml_backend_sched_set_tensor_backend(sched, cur_up, backend_gpu);
+        ggml_build_forward_expand(gf, cur_up);
+        if (mark_sparse_split) {
+            kairox_set_node_state(sched, cur_up, KAIROX_SPLIT_AXPY_SPARSE);
+            mark_axpy_split = true;
+        }
+
+        if (gate) {
+            cur_gate = ggml_add(ctx0, cur_gate, cur_gate_cpu);
+            cb(cur_gate, "ffn_gate_sparse_merge", il);
+            ggml_backend_sched_set_tensor_backend(sched, cur_gate, backend_gpu);
+            ggml_build_forward_expand(gf, cur_gate);
+        }
+    }
+
+    if (up_b) {
+        cur_up = ggml_add(ctx0, cur_up, up_b);
+        cb(cur_up, "ffn_up_b", il);
+    }
+
+    if (gate) {
+        if (gate_b) {
+            cur_gate = ggml_add(ctx0, cur_gate, gate_b);
+            cb(cur_gate, "ffn_gate_b", il);
+        }
+    }
+
+    ggml_tensor * cur_hidden = build_sparse_ffn_hidden(cur_up, cur_gate, model->arch, il);
+    ggml_tensor * cur_down   = ggml_axpy_sparse(ctx0, gpu_down, cur_hidden, sparse_idx, neuron_idx, threshold);
+    cb(cur_down, "ffn_down_sparse_gpu", il);
+    ggml_build_forward_expand(gf, cur_down);
+    if (mark_sparse_split && !mark_axpy_split) {
+        kairox_set_node_state(sched, cur_down, KAIROX_SPLIT_AXPY_SPARSE);
+    }
+
+    if (build_reload_path) {
+        GGML_ASSERT(cur_reload_plan);
+        ggml_tensor * cur_reload_down = reload_kairox_lc->build_reload_exec(ctx0, cur_reload_plan, KAIROX_FFN_DOWN);
+        cb(cur_reload_down, "ffn_down_reload", reload_il);
+        ggml_backend_sched_set_tensor_backend(sched, cur_reload_down, backend_gpu);
+        ggml_build_forward_expand(gf, cur_reload_down);
+        kairox_set_node_state(sched, cur_reload_down, KAIROX_SPLIT_BREAK);
+        reload_kairox_lc->reload_down = cur_reload_down;
+    }
+
+    if (!kairox_lc->gpu_only) {
+        ggml_tensor * cur_down_cpu = ggml_axpy_sparse(ctx0, down, cur_hidden, sparse_idx, neuron_mask, threshold);
+        cb(cur_down_cpu, "ffn_down_sparse_cpu", il);
+        ggml_backend_sched_set_tensor_backend(sched, cur_down_cpu, backend_cpu);
+        ggml_build_forward_expand(gf, cur_down_cpu);
+        kairox_register_dependency(sched, cur_hidden, cur_down_cpu, backend_gpu, KAIROX_EVENT_RECORD,
+                                   KAIROX_EVENT_SYNCHRONIZE);
+
+        cur_down = ggml_add(ctx0, cur_down, cur_down_cpu);
+        cb(cur_down, "ffn_down_sparse_merge", il);
+        ggml_backend_sched_set_tensor_backend(sched, cur_down, backend_gpu);
+        ggml_build_forward_expand(gf, cur_down);
+    }
+
+    if (down_b) {
+        cur_down = ggml_add(ctx0, cur_down, down_b);
+        cb(cur_down, "ffn_down_b", il);
+    }
+
+    return cur_down;
+}
+
+ggml_tensor * llm_graph_context::build_kairox_or_ffn(ggml_tensor *       cur,
+                                                         ggml_tensor *       inp_out_ids,
+                                                         const llama_model * model,
+                                                         int                 il,
+                                                         ggml_tensor *       up,
+                                                         ggml_tensor *       up_b,
+                                                         ggml_tensor *       up_s,
+                                                         ggml_tensor *       gate,
+                                                         ggml_tensor *       gate_b,
+                                                         ggml_tensor *       gate_s,
+                                                         ggml_tensor *       down_b,
+                                                         ggml_tensor *       down_s,
+                                                         ggml_tensor *       act_scales,
+                                                         llm_ffn_op_type     type_op,
+                                                         llm_ffn_gate_type   type_gate) const {
+    if (kairox_cm != nullptr) {
+        return build_sparse_ffn(cur, inp_out_ids, model, il);
+    }
+
+    ggml_tensor * down = model->layers[il].ffn_down;
+    if (model->params.use_kairox) {
+        down = ggml_reshape_2d(ctx0, model->layers[il].ffn_down_t, model->layers[il].ffn_down_t->ne[1],
+                               model->layers[il].ffn_down_t->ne[0]);
+    }
+
+    return build_ffn(cur, up, up_b, up_s, gate, gate_b, gate_s, down, down_b, down_s,
+            act_scales, type_op, type_gate, il);
 }
 
 ggml_tensor * llm_graph_context::build_moe_ffn(

@@ -80,15 +80,17 @@ llm_build_falcon::llm_build_falcon(const llama_model & model, const llm_graph_pa
         ggml_tensor * ffn_inp = cur;
 
         // feed forward
-        {
-            cur = build_ffn(attn_norm, // !! use the attn norm, not the result
-                    model.layers[il].ffn_up,   NULL, NULL,
-                    NULL,                      NULL, NULL,
-                    model.layers[il].ffn_down, NULL, NULL,
-                    NULL,
-                    LLM_FFN_GELU, LLM_FFN_SEQ, il);
-            cb(cur, "ffn_out", il);
+        llm_ffn_op_type ffn_op_type = LLM_FFN_GELU;
+        if (arch == LLM_ARCH_RELUFALCON) {
+            ffn_op_type = LLM_FFN_RELU;
         }
+        cur = build_kairox_or_ffn(attn_norm, inp_out_ids, &model, il, // !! use the attn norm, not the result
+                model.layers[il].ffn_up, NULL, NULL,
+                NULL,                    NULL, NULL,
+                NULL, NULL,
+                NULL,
+                ffn_op_type, LLM_FFN_SEQ);
+        cb(cur, "ffn_out", il);
 
         cur = ggml_add(ctx0, cur, ffn_inp);
         cur = ggml_add(ctx0, cur, inpL);

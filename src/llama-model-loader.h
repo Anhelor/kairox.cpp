@@ -75,6 +75,7 @@ struct llama_model_loader {
     uint64_t n_elements = 0;
     size_t   n_bytes    = 0;
 
+    bool use_kairox = false;
     bool use_mmap = false;
     bool use_direct_io = false;
     bool check_tensors;
@@ -126,6 +127,7 @@ struct llama_model_loader {
         const std::string & fname,
         std::vector<std::string> & splits, // optional, only need if the split does not follow naming scheme
         FILE * file,
+        bool use_kairox,
         bool use_mmap,
         bool use_direct_io,
         bool check_tensors,
