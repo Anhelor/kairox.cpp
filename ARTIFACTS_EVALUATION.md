@@ -1,5 +1,11 @@
 # KAIROX Artifact Evaluation Guide
 
+## Artifact-to-Paper Mapping
+
+This artifact corresponds to the following paper:
+
+Yapeng Jiang, Minghao Gan, Zicong Hong, Wuhui Chen, Junyuan Liang, Yue Yu, Meng Guo, and Zibin Zheng. "Kairox: Adaptive GPU-CPU Hybrid LLM Inference via Online Neuron Balancing." OSDI '26.
+
 This README describes the KAIROX artifact repository for OSDI'26 artifact evaluation. KAIROX is an adaptive GPU-CPU hybrid LLM inference system. The artifact is intended to validate the released implementation and check selected Figure 9 throughput trends for KAIROX against the included comparison systems (`llama_cpp` and `neuralink`).
 
 No separate clone of upstream llama.cpp is required; the artifact repository contains the modified llama.cpp tree, the KAIROX implementation, and the artifact-evaluation scripts.
